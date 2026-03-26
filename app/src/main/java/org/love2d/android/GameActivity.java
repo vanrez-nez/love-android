@@ -40,6 +40,7 @@ import android.view.WindowManager;
 import androidx.annotation.Keep;
 import androidx.core.app.ActivityCompat;
 
+import org.love2d.android.ble.BleManager;
 import org.libsdl.app.SDLActivity;
 
 import java.io.FileNotFoundException;
@@ -52,13 +53,16 @@ import java.util.Map;
 public class GameActivity extends SDLActivity {
     private static final String TAG = "GameActivity";
     public static final int RECORD_AUDIO_REQUEST_CODE = 3;
+    public static final int BLUETOOTH_REQUEST_CODE = 4;
 
     protected Vibrator vibrator;
     protected boolean shortEdgesMode;
     protected final int[] recordAudioRequestDummy = new int[1];
+    protected final int[] bluetoothRequestDummy = new int[1];
     private Uri delayedUri = null;
     private String[] args;
     private boolean isFused;
+    private BleManager bleManager;
 
     private static native void nativeSetDefaultStreamValues(int sampleRate, int framesPerBurst);
 
@@ -100,6 +104,8 @@ public class GameActivity extends SDLActivity {
             vibrator = (Vibrator) getSystemService(Context.VIBRATOR_SERVICE);
         }
 
+        bleManager = new BleManager(this);
+
         Intent intent = getIntent();
         handleIntent(intent, true);
         // Prevent SDL sending filedropped event. Let us do that instead.
@@ -140,6 +146,10 @@ public class GameActivity extends SDLActivity {
             vibrator.cancel();
         }
 
+        if (bleManager != null) {
+            bleManager.leave();
+        }
+
         super.onDestroy();
     }
 
@@ -154,24 +164,23 @@ public class GameActivity extends SDLActivity {
 
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] grantResults) {
-        if (grantResults.length > 0) {
-            Log.d("GameActivity", "Received a request permission result");
+        int result = grantResults.length > 0 ? grantResults[0] : PackageManager.PERMISSION_DENIED;
 
-            if (requestCode == RECORD_AUDIO_REQUEST_CODE) {
-                if (grantResults[0] == PackageManager.PERMISSION_GRANTED) {
-                    Log.d("GameActivity", "Mic permission granted");
-                } else {
-                    Log.d("GameActivity", "Did not get mic permission.");
-                }
+        Log.d("GameActivity", "Received a request permission result");
 
-                Log.d("GameActivity", "Unlocking LÖVE thread");
-                synchronized (recordAudioRequestDummy) {
-                    recordAudioRequestDummy[0] = grantResults[0];
-                    recordAudioRequestDummy.notify();
-                }
+        if (requestCode == RECORD_AUDIO_REQUEST_CODE) {
+            if (result == PackageManager.PERMISSION_GRANTED) {
+                Log.d("GameActivity", "Mic permission granted");
             } else {
-                super.onRequestPermissionsResult(requestCode, permissions, grantResults);
+                Log.d("GameActivity", "Did not get mic permission.");
             }
+
+            Log.d("GameActivity", "Unlocking LÖVE thread");
+            signalPermissionResult(recordAudioRequestDummy, result);
+        } else if (requestCode == BLUETOOTH_REQUEST_CODE) {
+            signalPermissionResult(bluetoothRequestDummy, result);
+        } else {
+            super.onRequestPermissionsResult(requestCode, permissions, grantResults);
         }
     }
 
@@ -315,12 +324,92 @@ public class GameActivity extends SDLActivity {
             RECORD_AUDIO_REQUEST_CODE);
 
         synchronized (recordAudioRequestDummy) {
-            try {
-                recordAudioRequestDummy.wait();
-            } catch (InterruptedException e) {
-                Log.d("GameActivity", "requesting mic permission", e);
-            }
+            waitForPermissionResult(recordAudioRequestDummy, "requesting mic permission");
         }
+    }
+
+    @Keep
+    public boolean hasBluetoothLE() {
+        return bleManager != null && bleManager.hasBluetoothLE();
+    }
+
+    @Keep
+    public boolean hasBluetoothPermissions() {
+        return bleManager != null && bleManager.hasBluetoothPermissions();
+    }
+
+    @Keep
+    public String getBluetoothRadioState() {
+        if (bleManager == null) {
+            return "unsupported";
+        }
+
+        return bleManager.getRadioState();
+    }
+
+    @Keep
+    public String getBluetoothAdapterAddress() {
+        if (bleManager == null) {
+            return "";
+        }
+
+        return bleManager.getAdapterAddress();
+    }
+
+    @Keep
+    public void requestBluetoothPermissions() {
+        if (bleManager == null || bleManager.hasBluetoothPermissions()) {
+            return;
+        }
+
+        bleManager.requestBluetoothPermissions(BLUETOOTH_REQUEST_CODE);
+
+        synchronized (bluetoothRequestDummy) {
+            waitForPermissionResult(bluetoothRequestDummy, "requesting bluetooth permission");
+        }
+    }
+
+    @Keep
+    public String bleDebugState() {
+        return bleManager != null ? bleManager.debugState() : "not initialized";
+    }
+
+    @Keep
+    public void bleApplyReliabilityConfig(double heartbeatInterval, int fragmentSpacingMs, int dedupWindow) {
+        if (bleManager != null)
+            bleManager.applyReliabilityConfig(heartbeatInterval, fragmentSpacingMs, dedupWindow);
+    }
+
+    @Keep
+    public boolean bleHost(String room, int maxClients, String transport) {
+        return bleManager != null && bleManager.host(room, maxClients, transport);
+    }
+
+    @Keep
+    public boolean bleScan() {
+        return bleManager != null && bleManager.scan();
+    }
+
+    @Keep
+    public boolean bleJoin(String roomId) {
+        return bleManager != null && bleManager.join(roomId);
+    }
+
+    @Keep
+    public void bleLeave() {
+        if (bleManager != null) {
+            bleManager.leave();
+        }
+    }
+
+    @Keep
+    public boolean bleBroadcast(String msgType, byte[] payload) {
+        return bleManager != null && bleManager.broadcast(msgType, payload);
+    }
+
+    @Keep
+    public boolean bleSend(String peerId, String msgType, byte[] payload) {
+        return bleManager != null && bleManager.send(peerId, msgType, payload);
     }
 
     public int getAudioSMP() {
@@ -428,6 +517,22 @@ public class GameActivity extends SDLActivity {
                 // Regular file, pass as-is.
                 args = new String[]{path};
             }
+        }
+    }
+
+    private void signalPermissionResult(int[] permissionDummy, int result) {
+        synchronized (permissionDummy) {
+            permissionDummy[0] = result;
+            permissionDummy.notifyAll();
+        }
+    }
+
+    private void waitForPermissionResult(int[] permissionDummy, String logContext) {
+        try {
+            permissionDummy.wait();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            Log.d(TAG, logContext, e);
         }
     }
 }
