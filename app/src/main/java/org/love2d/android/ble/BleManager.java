@@ -283,10 +283,15 @@ public class BleManager {
     // ══════════════════════════════════════════════════
 
     private boolean hasBluetoothPermissions() {
-        if (Build.VERSION.SDK_INT < 31) return true;
-        return context.checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
-            && context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
-            && context.checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED;
+        if (Build.VERSION.SDK_INT >= 31) {
+            return context.checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
+                && context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+                && context.checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED;
+        }
+        if (Build.VERSION.SDK_INT >= 23) {
+            return context.checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED;
+        }
+        return true;
     }
 
     private static final int BLE_PERMISSION_REQUEST_CODE = 9001;
@@ -300,6 +305,10 @@ public class BleManager {
                 Manifest.permission.BLUETOOTH_SCAN,
                 Manifest.permission.BLUETOOTH_CONNECT,
                 Manifest.permission.BLUETOOTH_ADVERTISE,
+            }, BLE_PERMISSION_REQUEST_CODE);
+        } else if (Build.VERSION.SDK_INT >= 23) {
+            activity.requestPermissions(new String[]{
+                Manifest.permission.ACCESS_FINE_LOCATION,
             }, BLE_PERMISSION_REQUEST_CODE);
         }
     }
