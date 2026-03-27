@@ -2870,7 +2870,11 @@ public class BleManager {
     @Keep
     public String getAddress() {
         if (bluetoothAdapter != null) {
-            return bluetoothAdapter.getAddress();
+            try {
+                return bluetoothAdapter.getAddress();
+            } catch (SecurityException e) {
+                return "";
+            }
         }
         return "";
     }
