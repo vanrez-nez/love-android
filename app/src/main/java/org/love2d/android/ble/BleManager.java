@@ -20,7 +20,11 @@ import android.bluetooth.le.ScanCallback;
 import android.bluetooth.le.ScanRecord;
 import android.bluetooth.le.ScanResult;
 import android.bluetooth.le.ScanSettings;
+import android.Manifest;
+import android.app.Activity;
 import android.content.Context;
+import android.content.pm.PackageManager;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
 import android.os.ParcelUuid;
@@ -271,11 +275,34 @@ public class BleManager {
         this.bluetoothManager = (BluetoothManager) context.getSystemService(Context.BLUETOOTH_SERVICE);
         this.bluetoothAdapter = (bluetoothManager != null) ? bluetoothManager.getAdapter() : null;
         this.localPeerId = generateShortId();
+        handler.post(this::requestBluetoothPermissions);
     }
 
     // ══════════════════════════════════════════════════
     //  Helpers
     // ══════════════════════════════════════════════════
+
+    private boolean hasBluetoothPermissions() {
+        if (Build.VERSION.SDK_INT < 31) return true;
+        return context.checkSelfPermission(Manifest.permission.BLUETOOTH_SCAN) == PackageManager.PERMISSION_GRANTED
+            && context.checkSelfPermission(Manifest.permission.BLUETOOTH_CONNECT) == PackageManager.PERMISSION_GRANTED
+            && context.checkSelfPermission(Manifest.permission.BLUETOOTH_ADVERTISE) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private static final int BLE_PERMISSION_REQUEST_CODE = 9001;
+
+    private void requestBluetoothPermissions() {
+        if (hasBluetoothPermissions()) return;
+        if (!(context instanceof Activity)) return;
+        Activity activity = (Activity) context;
+        if (Build.VERSION.SDK_INT >= 31) {
+            activity.requestPermissions(new String[]{
+                Manifest.permission.BLUETOOTH_SCAN,
+                Manifest.permission.BLUETOOTH_CONNECT,
+                Manifest.permission.BLUETOOTH_ADVERTISE,
+            }, BLE_PERMISSION_REQUEST_CODE);
+        }
+    }
 
     private static String generateShortId() {
         byte[] bytes = new byte[3];
@@ -1011,6 +1038,7 @@ public class BleManager {
     @Keep
     public String getRadioState() {
         if (bluetoothAdapter == null) return "unsupported";
+        if (!hasBluetoothPermissions()) return "unauthorized";
         if (!bluetoothAdapter.isEnabled()) return "off";
         return "on";
     }
@@ -1023,6 +1051,10 @@ public class BleManager {
     public void host(String roomNameParam, int maxClientsParam, String transportParam) {
         if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled()) {
             nativeOnDiagnostic("host: BLE not available");
+            return;
+        }
+        if (!hasBluetoothPermissions()) {
+            nativeOnError("unauthorized", "Bluetooth permissions not granted");
             return;
         }
 
@@ -1676,6 +1708,10 @@ public class BleManager {
             nativeOnDiagnostic("scan: BLE not available");
             return;
         }
+        if (!hasBluetoothPermissions()) {
+            nativeOnError("unauthorized", "Bluetooth permissions not granted");
+            return;
+        }
 
         // Spec 6.2 step 2-3
         stopScanInternal();
@@ -1803,6 +1839,10 @@ public class BleManager {
     public void join(String roomId) {
         if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled()) {
             nativeOnDiagnostic("join: BLE not available");
+            return;
+        }
+        if (!hasBluetoothPermissions()) {
+            nativeOnError("unauthorized", "Bluetooth permissions not granted");
             return;
         }
 
