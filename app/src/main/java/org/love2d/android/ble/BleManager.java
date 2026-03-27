@@ -2502,13 +2502,12 @@ public class BleManager {
         subscribedCentrals.clear();
         cancelAllGraceTimers();
 
-        // Keep existing roster but update host identity
-        // Remove old host, set self as host
-        for (SessionPeer peer : sessionPeers) {
-            if (peer.isHost) {
-                peer.isHost = false;
-            }
+        // Remove old host from roster (mirroring spec Section 8.2 step 3)
+        if (migrationOldHostId != null) {
+            removeSessionPeer(migrationOldHostId);
         }
+
+        // Set self as new host
         addSessionPeer(localPeerId, true, "connected");
         peerCount = 0; // No connected clients yet
 
