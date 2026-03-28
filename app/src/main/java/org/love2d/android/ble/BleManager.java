@@ -2884,19 +2884,6 @@ public class BleManager {
         scheduleMigrationTimeout();
     }
 
-    /** Clear all migration state fields */
-    private void clearMigrationState() {
-        migrationInProgress = false;
-        becomingHost = false;
-        migrationSuccessorId = null;
-        migrationSessionId = null;
-        migrationMaxClients = 0;
-        migrationRoomName = null;
-        migrationEpoch = 0;
-        migrationOldHostId = null;
-        migrationExcludedSuccessors.clear();
-    }
-
     // ══════════════════════════════════════════════════
     //  Leave (spec Section 6.6)
     // ══════════════════════════════════════════════════
