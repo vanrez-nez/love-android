@@ -90,6 +90,8 @@ public class BleManager {
     private static final long ASSEMBLY_TIMEOUT_MS = 15000;
     private static final long PENDING_CLIENT_TIMEOUT_MS = 5000;
     private static final long RECONNECT_TIMEOUT_MS = 10000;
+    private static final long DEPARTURE_SEND_TIMEOUT_MS = 100;
+    private static final long DEPARTURE_INTENT_EXPIRY_MS = 2000;
     private static final long DEDUP_EXPIRY_MS = 5000;
     private static final int DEDUP_WINDOW = 64;
     private static final long ROOM_EXPIRY_MS = 4000;
@@ -143,6 +145,8 @@ public class BleManager {
     private final HashMap<String, Integer> deviceMTUs = new HashMap<>();
     // Host: subscribed centrals (device addresses)
     private final HashSet<String> subscribedCentrals = new HashSet<>();
+    // Host: recent departure intents (peerId -> timestamp ms)
+    private final HashMap<String, Long> departureIntents = new HashMap<>();
 
     // ── Client state ──
 
@@ -158,6 +162,9 @@ public class BleManager {
     // Client: write queue (spec Section 15.1)
     private final LinkedList<byte[]> clientWriteQueue = new LinkedList<>();
     private boolean writeInFlight = false;
+    private final LinkedList<byte[]> departureWriteFragments = new LinkedList<>();
+    private boolean departureSendInProgress = false;
+    private Runnable departureSendTimeoutRunnable;
 
     // ── Scan state ──
 
@@ -997,7 +1004,11 @@ public class BleManager {
         if (!result) {
             writeInFlight = false;
             clientWriteQueue.clear();
+            departureWriteFragments.clear();
             nativeOnError("write_failed", "writeCharacteristic returned false");
+            if (departureSendInProgress) {
+                completeClientLeaveAfterDeparture();
+            }
         }
     }
 
@@ -1016,6 +1027,49 @@ public class BleManager {
         byte[] packetData = buildPacket("control", localPeerId, toPeerId, msgType, 0,
                 payload != null ? payload : new byte[0]);
         clientSendPacket(packetData);
+    }
+
+    private void completeClientLeaveAfterDeparture() {
+        if (!departureSendInProgress) return;
+
+        departureSendInProgress = false;
+        departureWriteFragments.clear();
+
+        if (departureSendTimeoutRunnable != null) {
+            handler.removeCallbacks(departureSendTimeoutRunnable);
+            departureSendTimeoutRunnable = null;
+        }
+
+        finishLeave();
+    }
+
+    private void sendClientLeavingAndLeave() {
+        if (hostPeerId == null || hostPeerId.isEmpty()
+                || clientGatt == null || remoteCharacteristic == null) {
+            finishLeave();
+            return;
+        }
+
+        byte[] packetData = buildPacket("control", localPeerId, hostPeerId, "client_leaving", 0, new byte[0]);
+        int payloadLimit = negotiatedMTU - ATT_OVERHEAD;
+        List<byte[]> fragments = fragmentPacket(packetData, payloadLimit);
+        if (fragments == null || fragments.isEmpty()) {
+            finishLeave();
+            return;
+        }
+
+        clientLeaving = true;
+        departureSendInProgress = true;
+        departureWriteFragments.clear();
+        departureWriteFragments.addAll(fragments);
+
+        if (departureSendTimeoutRunnable != null) {
+            handler.removeCallbacks(departureSendTimeoutRunnable);
+        }
+        departureSendTimeoutRunnable = () -> completeClientLeaveAfterDeparture();
+        handler.postDelayed(departureSendTimeoutRunnable, DEPARTURE_SEND_TIMEOUT_MS);
+
+        enqueueClientWrites(fragments);
     }
 
     private void clientSendData(String msgType, String toPeerId, byte[] payload) {
@@ -1356,6 +1410,8 @@ public class BleManager {
 
         if ("hello".equals(msgType)) {
             onHelloReceived(deviceAddress, packet);
+        } else if ("client_leaving".equals(msgType)) {
+            onClientLeavingReceived(deviceAddress, packet);
         } else if ("roster_request".equals(msgType)) {
             // Respond with roster_snapshot
             String peerId = devicePeerMap.get(deviceAddress);
@@ -1433,6 +1489,7 @@ public class BleManager {
 
         // Step 4: Remove from pending clients
         pendingClients.remove(deviceAddress);
+        departureIntents.remove(peerId);
 
         // Step 5: Bind device -> peer
         devicePeerMap.put(deviceAddress, peerId);
@@ -1535,7 +1592,33 @@ public class BleManager {
         // Step 3a: Remove from connected clients
         connectedClients.remove(peerId);
 
-        // Step 3b: If hosting and not in migration departure
+        Long departureAt = departureIntents.remove(peerId);
+        long now = System.currentTimeMillis();
+        if (departureAt != null && now - departureAt <= DEPARTURE_INTENT_EXPIRY_MS) {
+            removeSessionPeer(peerId);
+            membershipEpoch++;
+
+            nativeOnPeerLeft(peerId, "left");
+
+            byte[] reasonBytes = "left".getBytes(StandardCharsets.UTF_8);
+            for (String otherPeerId : new ArrayList<>(connectedClients.keySet())) {
+                byte[] plPacket = buildPacket("control", peerId, otherPeerId,
+                        "peer_left", 0, reasonBytes);
+                String devAddr = deviceAddressForPeer(otherPeerId);
+                if (devAddr == null) continue;
+                int mtu = mtuForDevice(devAddr);
+                int payloadLimit = mtu - ATT_OVERHEAD;
+                List<byte[]> fragments = fragmentPacket(plPacket, payloadLimit);
+                if (fragments != null) enqueueNotifications(fragments, devAddr);
+            }
+
+            broadcastControl("roster_snapshot", encodeRosterSnapshotPayload());
+            peerCount = connectedClientCount();
+            restartAdvertising();
+            return;
+        }
+
+        // Step 3c: If hosting and not in migration departure
         if (hosting && !migrationInProgress) {
             beginPeerReconnectGrace(peerId);
         } else {
@@ -1544,6 +1627,14 @@ public class BleManager {
             peerCount = connectedClientCount();
             restartAdvertising();
         }
+    }
+
+    private void onClientLeavingReceived(String deviceAddress, Packet packet) {
+        String peerId = packet.fromPeerId;
+        if (peerId == null || peerId.isEmpty()) return;
+        if (!connectedClients.containsKey(peerId)) return;
+
+        departureIntents.put(peerId, System.currentTimeMillis());
     }
 
     // ══════════════════════════════════════════════════
@@ -1992,6 +2083,12 @@ public class BleManager {
     private void stopClientOnly() {
         writeInFlight = false;
         clientWriteQueue.clear();
+        departureWriteFragments.clear();
+        departureSendInProgress = false;
+        if (departureSendTimeoutRunnable != null) {
+            handler.removeCallbacks(departureSendTimeoutRunnable);
+            departureSendTimeoutRunnable = null;
+        }
 
         if (clientGatt != null) {
             try {
@@ -2095,6 +2192,11 @@ public class BleManager {
             handler.post(() -> {
                 // Spec Section 15.1 step 6
                 if (!clientWriteQueue.isEmpty()) {
+                    byte[] writtenFragment = clientWriteQueue.peek();
+                    if (!departureWriteFragments.isEmpty()
+                            && writtenFragment == departureWriteFragments.peek()) {
+                        departureWriteFragments.poll();
+                    }
                     clientWriteQueue.poll(); // Remove written fragment
                 }
                 writeInFlight = false;
@@ -2102,10 +2204,17 @@ public class BleManager {
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     // Step 6c: Clear queue, emit error
                     clientWriteQueue.clear();
+                    departureWriteFragments.clear();
                     nativeOnError("write_failed", "GATT write status=" + status);
+                    if (departureSendInProgress) {
+                        completeClientLeaveAfterDeparture();
+                    }
                 } else {
                     // Step 6d: Pump next
                     pumpClientWriteQueue();
+                    if (departureSendInProgress && departureWriteFragments.isEmpty()) {
+                        completeClientLeaveAfterDeparture();
+                    }
                 }
             });
         }
@@ -2899,6 +3008,11 @@ public class BleManager {
             }
         }
 
+        if (!hosting && clientJoined) {
+            sendClientLeavingAndLeave();
+            return;
+        }
+
         leaveInternal();
     }
 
@@ -2917,6 +3031,13 @@ public class BleManager {
         stopHeartbeat();
         cancelAllGraceTimers();
         cancelMigrationTimeout();
+        departureIntents.clear();
+        departureSendInProgress = false;
+        departureWriteFragments.clear();
+        if (departureSendTimeoutRunnable != null) {
+            handler.removeCallbacks(departureSendTimeoutRunnable);
+            departureSendTimeoutRunnable = null;
+        }
         if (reconnectTimeoutRunnable != null) {
             handler.removeCallbacks(reconnectTimeoutRunnable);
             reconnectTimeoutRunnable = null;
