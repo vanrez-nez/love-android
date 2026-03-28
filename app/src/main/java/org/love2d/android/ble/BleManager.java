@@ -76,7 +76,8 @@ public class BleManager {
 
     // ── Protocol constants (spec Section 17) ──
 
-    private static final byte PROTOCOL_VERSION = 1;
+    private static final byte PROTOCOL_VERSION = 1;         // packet/fragment envelope version (always 1)
+    private static final int CURRENT_PROTOCOL_VERSION = 4;  // application-level protocol version (spec Section 3.1)
     private static final int DESIRED_MTU = 185;
     private static final int DEFAULT_MTU = 23;
     private static final int ATT_OVERHEAD = 3;
@@ -96,6 +97,7 @@ public class BleManager {
     private static final int MAX_CONCURRENT_ASSEMBLIES_PER_SOURCE = 32;
     private static final long MIGRATION_DEPARTURE_DELAY_MS = 400;
     private static final long MIGRATION_TIMEOUT_MS = 3000;
+    private static final long RECOVERY_HOST_PROBE_DURATION_MS = 1500; // spec Section 8.2
 
     // ── Core references ──
 
@@ -191,6 +193,8 @@ public class BleManager {
     // ── Migration/reconnect flags ──
 
     private boolean migrationInProgress = false;
+    private boolean recoveryHostProbeActive = false;
+    private Runnable recoveryHostProbeRunnable;
     private boolean reconnectInProgress = false;
     private boolean reconnectScanInProgress = false;
     private boolean reconnectJoinInProgress = false;
@@ -223,6 +227,8 @@ public class BleManager {
         String roomName;
         int rssi;
         long lastSeenMs;
+        int protoVersion;
+        boolean incompatible;
     }
 
     /** Session peer entry for roster tracking */
@@ -331,17 +337,21 @@ public class BleManager {
 
     /** Spec Section 3.1: Encode room advertisement string */
     private String encodeRoomAdvertisement() {
-        return "LB1" + sessionId + localPeerId + transportChar
+        return "LB" + (char)('0' + CURRENT_PROTOCOL_VERSION) + sessionId + localPeerId + transportChar
                 + maxClients + peerCount + roomName;
     }
 
     /** Spec Section 3.4: Decode room from UTF-8 payload string */
     private static RoomInfo decodeRoomFromString(String str, String roomId, int rssi) {
         if (str == null || str.length() < 18) return null;
-        if (!str.startsWith("LB1")) return null;
+        if (!str.startsWith("LB")) return null;
+
+        int protoVersion = str.charAt(2) - '0';
 
         RoomInfo room = new RoomInfo();
         room.roomId = roomId;
+        room.protoVersion = protoVersion;
+        room.incompatible = (protoVersion != CURRENT_PROTOCOL_VERSION);
         room.sessionId = str.substring(3, 9);
         room.hostPeerId = str.substring(9, 15);
         room.transport = str.charAt(15);
@@ -758,6 +768,13 @@ public class BleManager {
                 it.remove();
             }
         }
+    }
+
+    private boolean isKnownSessionPeer(String peerId) {
+        for (SessionPeer p : sessionPeers) {
+            if (p.peerId.equals(peerId)) return true;
+        }
+        return false;
     }
 
     private void updateSessionPeerStatus(String peerId, String status) {
@@ -1362,14 +1379,16 @@ public class BleManager {
             return;
         }
 
-        // Step 2: Parse payload — "session_id|join_intent"
+        // Step 2: Parse payload — "session_id|join_intent|proto_version" (spec Section 4.3)
+        // Missing proto_version field is treated as version 1 (spec Section 6.5)
         String payloadStr = new String(packet.payload, StandardCharsets.UTF_8);
-        String helloSessionId = "";
-        String joinIntent = "fresh";
-        int pipeIdx = payloadStr.indexOf('|');
-        if (pipeIdx >= 0) {
-            helloSessionId = payloadStr.substring(0, pipeIdx);
-            joinIntent = payloadStr.substring(pipeIdx + 1);
+        String[] helloParts = payloadStr.split("\\|", -1);
+        String helloSessionId = helloParts.length > 0 ? helloParts[0] : "";
+        String joinIntent = helloParts.length > 1 ? helloParts[1] : "fresh";
+        int clientProtoVersion = 1;
+        if (helloParts.length > 2 && !helloParts[2].isEmpty()) {
+            try { clientProtoVersion = Integer.parseInt(helloParts[2]); }
+            catch (NumberFormatException ignored) {}
         }
 
         // Step 3: Validate admission
@@ -1402,6 +1421,13 @@ public class BleManager {
         // 3e: migration_mismatch
         if ("migration_resume".equals(joinIntent) && !migrationInProgress) {
             sendJoinRejected(deviceAddress, peerId, "migration_mismatch");
+            return;
+        }
+
+        // 3f: incompatible_version — protocol version mismatch (spec Section 6.5)
+        if (clientProtoVersion != CURRENT_PROTOCOL_VERSION) {
+            sendJoinRejected(deviceAddress, peerId, "incompatible_version");
+            disconnectDevice(deviceAddress);
             return;
         }
 
@@ -1756,6 +1782,12 @@ public class BleManager {
 
         discoveredRooms.put(room.roomId, room);
 
+        // Recovery Host Probe (spec Section 8.2 step 7a) — check before other routing
+        if (recoveryHostProbeActive) {
+            onScanResultDuringRecoveryProbe(room);
+            return;
+        }
+
         // Check reconnect scan (reconnect takes priority check)
         if (reconnectScanInProgress && !migrationInProgress) {
             onScanResultDuringReconnect(room);
@@ -1772,22 +1804,76 @@ public class BleManager {
         if (!migrationInProgress && !reconnectInProgress) {
             String transport = (room.transport == 's') ? "resilient" : "reliable";
             nativeOnRoomFound(room.roomId, room.sessionId, room.roomName,
-                    transport, room.peerCount, room.maxClients, room.rssi);
+                    transport, room.peerCount, room.maxClients, room.rssi,
+                    room.protoVersion, room.incompatible);
         }
     }
 
-    /** Handle scan result during active migration — look for successor's advertisement */
+    /** Handle scan result during Recovery Host Probe (spec Section 8.2 step 7a).
+     *  Invoked only when recoveryHostProbeActive is true and we are the elected successor. */
+    private void onScanResultDuringRecoveryProbe(RoomInfo room) {
+        if (migrationSessionId == null) return;
+        if (!room.sessionId.equals(migrationSessionId)) return;
+
+        if (room.hostPeerId.equals(migrationOldHostId)) {
+            // Old host is still alive — abort self-election, reconnect to it
+            bleLog("recoveryHostProbe: old host still alive, reconnecting");
+            cancelRecoveryHostProbe();
+            clearMigrationState();
+            beginClientReconnect();
+        } else if (isKnownSessionPeer(room.hostPeerId)) {
+            // Another session peer is already advertising as host — connect to them
+            bleLog("recoveryHostProbe: peer " + room.hostPeerId + " already hosting, connecting");
+            cancelRecoveryHostProbe();
+            migrationSuccessorId = room.hostPeerId;
+            hostPeerId = room.hostPeerId;
+            becomingHost = false;
+            stopScanInternal();
+            connectToRoom(room, true);
+        }
+        // Otherwise: ignore — keep scanning until probe timer fires
+    }
+
+    private void cancelRecoveryHostProbe() {
+        recoveryHostProbeActive = false;
+        if (recoveryHostProbeRunnable != null) {
+            handler.removeCallbacks(recoveryHostProbeRunnable);
+            recoveryHostProbeRunnable = null;
+        }
+        stopScanInternal();
+    }
+
+    private void clearMigrationState() {
+        migrationInProgress = false;
+        becomingHost = false;
+        migrationSuccessorId = null;
+        migrationSessionId = null;
+        migrationMaxClients = 0;
+        migrationRoomName = null;
+        migrationEpoch = 0;
+        migrationOldHostId = null;
+        migrationExcludedSuccessors.clear();
+        cancelMigrationTimeout();
+    }
+
+    /** Handle scan result during active migration — look for successor's advertisement.
+     *  Implements spec Section 8.4 steps 2-3, including "first advertiser wins" rule. */
     private void onScanResultDuringMigration(RoomInfo room) {
-        if (migrationSuccessorId == null || migrationSessionId == null) return;
+        if (migrationSessionId == null) return;
+        if (!room.sessionId.equals(migrationSessionId)) return;
 
-        // Check if the advertising host is our expected successor with our session
-        if (room.hostPeerId.equals(migrationSuccessorId)
-                && room.sessionId.equals(migrationSessionId)) {
+        if (migrationSuccessorId != null && room.hostPeerId.equals(migrationSuccessorId)) {
+            // Step 2: elected successor is advertising — connect
             bleLog("migration: found successor " + migrationSuccessorId + " advertising");
-
-            // Connect to the new host
             stopScanInternal();
             hostPeerId = migrationSuccessorId;
+            connectToRoom(room, true);
+        } else if (isKnownSessionPeer(room.hostPeerId)) {
+            // Step 3: "first advertiser wins" — a different known session member got there first
+            bleLog("migration: first-advertiser-wins, peer " + room.hostPeerId + " hosting instead");
+            stopScanInternal();
+            migrationSuccessorId = room.hostPeerId;
+            hostPeerId = room.hostPeerId;
             connectToRoom(room, true);
         }
     }
@@ -2063,8 +2149,8 @@ public class BleManager {
             helloSessionId = (joinedSessionId != null) ? joinedSessionId : "";
         }
 
-        // Step 5: Send HELLO
-        String helloPayload = helloSessionId + "|" + joinIntent;
+        // Step 5: Send HELLO — payload: "session_id|join_intent|proto_version" (spec Section 4.3)
+        String helloPayload = helloSessionId + "|" + joinIntent + "|" + CURRENT_PROTOCOL_VERSION;
         clientSendControl("hello", hostPeerId, helloPayload.getBytes(StandardCharsets.UTF_8));
 
         // Step 6: Await host response (handled in packet handler)
@@ -2183,23 +2269,23 @@ public class BleManager {
         // Step 1: Clean up GATT state
         stopClientOnly();
 
-        // Step 2: Active migration
+        // Step 2: Active migration (spec Section 13 step 4)
         if (migrationInProgress) {
             beginMigrationReconnect();
             return;
         }
 
-        // Step 3: Resilient transport recovery
-        if (shouldEmit && wasJoined && transportChar == 's') {
-            if (beginUnexpectedHostRecovery()) return;
-        }
-
-        // Step 4: Attempt reconnect
+        // Step 3: Attempt reconnect (spec Section 13 step 5) — try this BEFORE recovery
         if (shouldEmit && wasJoined) {
             if (beginClientReconnect()) return;
         }
 
-        // Step 5: Emit session ended or error
+        // Step 4: Resilient transport recovery (spec Section 13 step 6)
+        if (shouldEmit && wasJoined && transportChar == 's') {
+            if (beginUnexpectedHostRecovery()) return;
+        }
+
+        // Step 5: Emit session ended or error (spec Section 13 step 7)
         if (shouldEmit) {
             finishLeaveClient();
             if (wasJoined) {
@@ -2210,7 +2296,7 @@ public class BleManager {
             return;
         }
 
-        // Step 6: Silent cleanup
+        // Step 6: Silent cleanup (spec Section 13 step 8)
         finishLeaveClient();
     }
 
@@ -2325,6 +2411,20 @@ public class BleManager {
     }
 
     private void onReconnectTimeout() {
+        // Spec Section 7.1 OnReconnectTimeout:
+        // For Resilient transport, clear reconnect scan state (preserve session/host/roster)
+        // and attempt unexpected host recovery before giving up.
+        if (transportChar == 's') {
+            if (reconnectTimeoutRunnable != null) {
+                handler.removeCallbacks(reconnectTimeoutRunnable);
+                reconnectTimeoutRunnable = null;
+            }
+            reconnectScanInProgress = false;
+            reconnectJoinInProgress = false;
+            stopScanInternal();
+            // reconnectInProgress, joinedSessionId, hostPeerId, sessionPeers preserved intentionally
+            if (beginUnexpectedHostRecovery()) return;
+        }
         failReconnect();
     }
 
@@ -2446,10 +2546,44 @@ public class BleManager {
         bleLog("beginUnexpectedHostRecovery: successor=" + successor
                 + " becomingHost=" + becomingHost);
 
-        // Step 8-9: Begin migration reconnect
+        // Step 7a: Recovery Host Probe (spec Section 8.2) — only when we are the elected successor.
+        // Scan for RECOVERY_HOST_PROBE_DURATION_MS to check if old host is still alive or
+        // another peer has already started advertising before committing to host role.
+        if (becomingHost) {
+            recoveryHostProbeActive = true;
+            startProbeOrMigrationScan();
+            recoveryHostProbeRunnable = () -> {
+                recoveryHostProbeActive = false;
+                bleLog("recoveryHostProbe: timeout, proceeding to host");
+                beginMigrationReconnect();
+            };
+            handler.postDelayed(recoveryHostProbeRunnable, RECOVERY_HOST_PROBE_DURATION_MS);
+            return true;
+        }
+
+        // Step 8-9: Begin migration reconnect (non-host path)
         beginMigrationReconnect();
 
         return true;
+    }
+
+    /** Start a low-latency BLE scan for the Recovery Host Probe or migration reconnect. */
+    private void startProbeOrMigrationScan() {
+        if (bluetoothAdapter == null || !bluetoothAdapter.isEnabled()) return;
+        scanner = bluetoothAdapter.getBluetoothLeScanner();
+        if (scanner == null) return;
+        ScanSettings settings = new ScanSettings.Builder()
+                .setScanMode(ScanSettings.SCAN_MODE_LOW_LATENCY)
+                .setCallbackType(ScanSettings.CALLBACK_TYPE_ALL_MATCHES)
+                .build();
+        scanCallback = new ScanCallback() {
+            @Override
+            public void onScanResult(int callbackType, ScanResult result) {
+                handler.post(() -> handleScanResult(result));
+            }
+        };
+        scanning = true;
+        scanner.startScan(null, settings, scanCallback);
     }
 
     /** Spec Section 8.4: BeginMigrationReconnect — either start hosting
@@ -2965,7 +3099,8 @@ public class BleManager {
     private native void nativeOnJoined(String sessionId, String roomId, String peerId, String hostId, String transport);
     private native void nativeOnJoinFailed(String reason, String roomId);
     private native void nativeOnRoomFound(String roomId, String sessionId, String name,
-                                           String transport, int peerCount, int max, int rssi);
+                                           String transport, int peerCount, int max, int rssi,
+                                           int protoVersion, boolean incompatible);
     private native void nativeOnRoomLost(String roomId);
     private native void nativeOnPeerJoined(String peerId);
     private native void nativeOnPeerLeft(String peerId, String reason);
