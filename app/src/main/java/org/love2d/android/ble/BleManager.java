@@ -2103,18 +2103,44 @@ public class BleManager {
         negotiatedMTU = DEFAULT_MTU;
     }
 
+    private void handleClientConnectFailure(String detail) {
+        stopClientOnly();
+
+        if (reconnectJoinInProgress) {
+            reconnectJoinInProgress = false;
+            reconnectScanInProgress = true;
+            scanForReconnect();
+            return;
+        }
+
+        if (migrationInProgress && !becomingHost) {
+            scanForMigration();
+            return;
+        }
+
+        finishLeaveClient();
+        nativeOnError("join_failed", detail);
+    }
+
     // ── GATT Client Callback ──
 
     private final BluetoothGattCallback gattClientCallback = new BluetoothGattCallback() {
         @Override
         public void onConnectionStateChange(BluetoothGatt gatt, int status, int newState) {
             handler.post(() -> {
+                if (gatt != clientGatt) {
+                    return;
+                }
                 if (newState == BluetoothProfile.STATE_CONNECTED) {
                     bleLog("client GATT connected");
                     // Step 7a: Request MTU
                     gatt.requestMtu(DESIRED_MTU);
                 } else if (newState == BluetoothProfile.STATE_DISCONNECTED) {
                     bleLog("client GATT disconnected, status=" + status);
+                    if (!clientJoined && status != BluetoothGatt.GATT_SUCCESS) {
+                        handleClientConnectFailure("connection_failed (gatt_status=" + status + ")");
+                        return;
+                    }
                     onClientDisconnected(clientJoined, !clientLeaving);
                 }
             });
@@ -2123,6 +2149,9 @@ public class BleManager {
         @Override
         public void onMtuChanged(BluetoothGatt gatt, int mtu, int status) {
             handler.post(() -> {
+                if (gatt != clientGatt) {
+                    return;
+                }
                 if (status == BluetoothGatt.GATT_SUCCESS) {
                     negotiatedMTU = mtu;
                     bleLog("client MTU: " + mtu);
@@ -2138,9 +2167,12 @@ public class BleManager {
         @Override
         public void onServicesDiscovered(BluetoothGatt gatt, int status) {
             handler.post(() -> {
+                if (gatt != clientGatt) {
+                    return;
+                }
                 if (status != BluetoothGatt.GATT_SUCCESS) {
                     bleLog("service discovery failed: " + status);
-                    onClientDisconnected(false, true);
+                    handleClientConnectFailure("service_discovery_failed (gatt_status=" + status + ")");
                     return;
                 }
 
@@ -2148,14 +2180,14 @@ public class BleManager {
                 BluetoothGattService service = gatt.getService(SERVICE_UUID);
                 if (service == null) {
                     bleLog("service not found");
-                    onClientDisconnected(false, true);
+                    handleClientConnectFailure("service_not_found");
                     return;
                 }
 
                 remoteCharacteristic = service.getCharacteristic(CHARACTERISTIC_UUID);
                 if (remoteCharacteristic == null) {
                     bleLog("characteristic not found");
-                    onClientDisconnected(false, true);
+                    handleClientConnectFailure("characteristic_not_found");
                     return;
                 }
 
@@ -2175,6 +2207,9 @@ public class BleManager {
         @Override
         public void onDescriptorWrite(BluetoothGatt gatt, BluetoothGattDescriptor descriptor, int status) {
             handler.post(() -> {
+                if (gatt != clientGatt) {
+                    return;
+                }
                 if (CCCD_UUID.equals(descriptor.getUuid())) {
                     if (status == BluetoothGatt.GATT_SUCCESS) {
                         bleLog("CCCD write success");
@@ -2190,6 +2225,9 @@ public class BleManager {
         @Override
         public void onCharacteristicWrite(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic, int status) {
             handler.post(() -> {
+                if (gatt != clientGatt) {
+                    return;
+                }
                 // Spec Section 15.1 step 6
                 if (!clientWriteQueue.isEmpty()) {
                     byte[] writtenFragment = clientWriteQueue.peek();
@@ -2223,6 +2261,9 @@ public class BleManager {
         public void onCharacteristicChanged(BluetoothGatt gatt, BluetoothGattCharacteristic characteristic) {
             final byte[] value = characteristic.getValue();
             handler.post(() -> {
+                if (gatt != clientGatt) {
+                    return;
+                }
                 if (value == null) return;
                 handleClientIncomingFragment(value);
             });
